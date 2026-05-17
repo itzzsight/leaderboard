@@ -8,18 +8,23 @@ const client = new Client({
 });
 
 const API_URL = 'https://api.roulobets.com/v1/external/affiliates';
-const API_KEY = process.env.ROULOBETS_API_KEY;
-
-const CHANNEL_ID = process.env.LEADERBOARD_CHANNEL_ID;
 
 let leaderboardMessage = null;
 
-// Get today's date (YYYY-MM-DD)
+let started = false;
+let lastUpdate = 0;
+const COOLDOWN = 15 * 60 * 1000;
+
+// =====================
+// DATE
+// =====================
 function getToday() {
   return new Date().toISOString().split('T')[0];
 }
 
-// Fetch API data
+// =====================
+// API
+// =====================
 async function fetchLeaderboard() {
   const today = getToday();
 
@@ -27,33 +32,44 @@ async function fetchLeaderboard() {
     params: {
       start_at: today,
       end_at: today,
-      key: API_KEY,
+      key: process.env.ROULOBETS_API_KEY,
     },
   });
 
-  return res.data;
+  return res.data?.data || [];
 }
 
-// Build embed
-function buildEmbed(data) {
+// =====================
+// EMBED
+// =====================
+function buildEmbed(list) {
   const embed = new EmbedBuilder()
     .setTitle('🏆 Wager Leaderboard')
-    .setColor(0x00ff99)
+    .setColor(0xFFD700)
+    .setFooter({ text: 'Updates every 15 minutes' })
     .setTimestamp();
-
-  const list = data?.data || [];
 
   if (!list.length) {
     embed.setDescription("No data available.");
     return embed;
   }
 
-  const sorted = list.sort((a, b) => (b.wagered || 0) - (a.wagered || 0));
+  const sorted = list
+    .sort((a, b) => (b.wagered || 0) - (a.wagered || 0))
+    .slice(0, 10);
 
-  let desc = '';
+  let desc = "";
 
-  sorted.slice(0, 10).forEach((u, i) => {
-    desc += `**#${i + 1}** ${u.username || 'Unknown'} — $${Number(u.wagered || 0).toLocaleString()}\n`;
+  sorted.forEach((u, i) => {
+    const name = u.username || "Unknown";
+    const wager = Number(u.wagered || 0).toLocaleString();
+
+    const medal =
+      i === 0 ? "🥇" :
+      i === 1 ? "🥈" :
+      i === 2 ? "🥉" : `**${i + 1}.**`;
+
+    desc += `${medal} **${name}** → 💰 $${wager}\n`;
   });
 
   embed.setDescription(desc);
@@ -61,34 +77,98 @@ function buildEmbed(data) {
   return embed;
 }
 
-// Update leaderboard
+// =====================
+// MESSAGE ID HELPERS (CHANNEL TOPIC STORAGE)
+// =====================
+function getMessageIdFromTopic(topic) {
+  const match = topic?.match(/leaderboardMessageId=(\d+)/);
+  return match ? match[1] : null;
+}
+
+function setMessageIdInTopic(topic, id) {
+  const base = (topic || '').replace(/leaderboardMessageId=\d+/, '').trim();
+  return `${base} leaderboardMessageId=${id}`.trim();
+}
+
+// =====================
+// UPDATE
+// =====================
 async function updateLeaderboard() {
   try {
-    const channel = await client.channels.fetch(CHANNEL_ID);
+    const now = Date.now();
+
+    if (now - lastUpdate < COOLDOWN) {
+      console.log("Skipped update (cooldown)");
+      return;
+    }
+
+    lastUpdate = now;
 
     const data = await fetchLeaderboard();
     const embed = buildEmbed(data);
 
-    if (!leaderboardMessage) {
-      leaderboardMessage = await channel.send({ embeds: [embed] });
-    } else {
+    if (leaderboardMessage) {
       await leaderboardMessage.edit({ embeds: [embed] });
     }
 
-    console.log('Leaderboard updated');
+    console.log("Leaderboard updated ✔");
+
   } catch (err) {
-    console.error('Error updating leaderboard:', err.message);
+    console.error("Update error:", err.message);
   }
 }
 
-// Bot ready
+// =====================
+// READY
+// =====================
 client.once('ready', async () => {
+  if (started) return;
+  started = true;
+
   console.log(`Logged in as ${client.user.tag}`);
 
-  await updateLeaderboard();
+  const channel = await client.channels.fetch(process.env.LEADERBOARD_CHANNEL_ID);
 
-  setInterval(updateLeaderboard, 15 * 60 * 1000);
+  // 🔥 TRY RECOVER MESSAGE FROM CHANNEL TOPIC
+  const savedId = getMessageIdFromTopic(channel.topic);
+
+  if (savedId) {
+    try {
+      leaderboardMessage = await channel.messages.fetch(savedId);
+      console.log("Recovered old leaderboard message");
+    } catch {
+      leaderboardMessage = null;
+    }
+  }
+
+  // 🔥 IF NO MESSAGE FOUND, CREATE ONE
+  if (!leaderboardMessage) {
+    leaderboardMessage = await channel.send({
+      embeds: [
+        new EmbedBuilder()
+          .setTitle("🏆 Wager Leaderboard")
+          .setDescription("Initializing leaderboard...")
+          .setColor(0xFFD700)
+      ]
+    });
+
+    // SAVE MESSAGE ID INTO CHANNEL TOPIC
+    await channel.setTopic(
+      setMessageIdInTopic(channel.topic, leaderboardMessage.id)
+    );
+
+    console.log("Created and saved leaderboard message");
+  }
+
+  console.log("Bot ready — starting updates in 60s");
+
+  setTimeout(() => {
+    updateLeaderboard();
+    setInterval(updateLeaderboard, COOLDOWN);
+  }, 60000);
 });
 
-// Login
+// =====================
+// LOGIN
+// =====================
 client.login(process.env.DISCORD_TOKEN);
